@@ -1,305 +1,411 @@
-# pylint: disable=wrong-import-order
+# -*- encoding: utf-8 -*-
+#
+# Copyright © 2014 Alexey Dubkov
+#
+# This file is part of py-zabbix.
+#
+# Py-zabbix is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Py-zabbix is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with py-zabbix. If not, see <http://www.gnu.org/licenses/>.
 
+import json
 import logging
-from typing import Mapping, Optional, Sequence, Tuple, Union
-from warnings import warn
+import os
+import ssl
+import sys
+import base64
 
-from packaging.version import Version
-from requests import Session
+# For Python 2 and 3 compatibility
+try:
+    import urllib2
+except ImportError:
+    # Since Python 3, urllib2.Request and urlopen were moved to
+    # the urllib.request.
+    import urllib.request as urllib2
 
-__all__ = [
-    "ZabbixAPI",
-    "ZabbixAPIException",
-    "ZabbixAPIMethod",
-    "ZabbixAPIObject",
-    "ZabbixAPIObjectClass",
-]
+from .version import __version__
+from .logger import NullHandler, HideSensitiveFilter, HideSensitiveService
 
+null_handler = NullHandler()
 logger = logging.getLogger(__name__)
-logger.addHandler(logging.NullHandler())
-
-ZABBIX_5_4_0 = Version("5.4.0")
-ZABBIX_6_4_0 = Version("6.4.0")
+logger.addHandler(null_handler)
+logger.addFilter(HideSensitiveFilter())
 
 
 class ZabbixAPIException(Exception):
-    """Generic Zabbix API exception
+    """ZabbixAPI exception class.
 
-    Codes:
-      -32700: invalid JSON. An error occurred on the server while
-              parsing the JSON text (typo, wrong quotes, etc.)
-      -32600: received JSON is not a valid JSON-RPC Request
-      -32601: requested remote-procedure does not exist
-      -32602: invalid method parameters
-      -32603: Internal JSON-RPC error
-      -32400: System error
-      -32300: Transport error
-      -32500: Application error
+    :code list:
+    :32602: Invalid params (eg already exists)
+    :32500: No permissions
+    """
+    def __init__(self, *args):
+        super(Exception, self).__init__(*args)
+        if len(args) == 1 and isinstance(args[0], dict):
+            self.error = args[0]
+            self.error['json'] = HideSensitiveService.hide_sensitive(self.error['json'])
+            self.message = self.error['message']
+            self.code = self.error['code']
+            self.data = self.error['data']
+            self.json = self.error['json']
+
+
+class ZabbixAPIObjectClass(object):
+    """ZabbixAPI Object class.
+
+    :type group: str
+    :param group: Zabbix API method group name.
+        Example: `apiinfo.version` method it will be `apiinfo`.
+
+    :type parent: :class:`zabbix.api.ZabbixAPI` object
+    :param parent: ZabbixAPI object to use as parent.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args)
+    def __init__(self, group, parent):
+        self.group = group
+        self.parent = parent
 
-        self.error = kwargs.get("error", None)
+    def __getattr__(self, name):
+        """Dynamically create a method.
 
-
-# pylint: disable=too-many-instance-attributes
-class ZabbixAPI:
-    # pylint: disable=too-many-arguments
-    def __init__(
-        self,
-        server: str = "http://localhost/zabbix",
-        session: Optional[Session] = None,
-        use_authenticate: bool = False,
-        timeout: Optional[Union[float, int, Tuple[int, int]]] = None,
-        detect_version: bool = True,
-    ):
+        :type name: str
+        :param name: Zabbix API method name.
+            Example: `apiinfo.version` method it will be `version`.
         """
-        :param server: Base URI for zabbix web interface (omitting /api_jsonrpc.php)
-        :param session: optional pre-configured requests.Session instance
-        :param use_authenticate: Use old (Zabbix 1.8) style authentication
-        :param timeout: optional connect and read timeout in seconds, default: None
-                        If you're using Requests >= 2.4 you can set it as
-                        tuple: "(connect, read)" which is used to set individual
-                        connect and read timeouts.
-        :param detect_version: autodetect Zabbix API version
-        """
-        self.session = session or Session()
 
-        # Default headers for all requests
-        self.session.headers.update(
-            {
-                "Content-Type": "application/json-rpc",
-                "User-Agent": "python/pyzabbix",
-                "Cache-Control": "no-cache",
-            }
-        )
+        def fn(*args, **kwargs):
+            if args and kwargs:
+                raise TypeError("Found both args and kwargs")
+
+            method = '{0}.{1}'.format(self.group, name)
+            logger.debug("Call %s method", method)
+
+            return self.parent.do_request(
+                method,
+                args or kwargs
+            )['result']
+
+        return fn
+
+
+def ssl_context_compat(func):
+    def inner(req):
+        # We should explicitly disable cert verification to support
+        # self-signed certs with urllib2 since Python 2.7.9 and 3.4.3
+
+        default_version = (2, 7, 9)
+        version = {
+            2: default_version,
+            3: (3, 4, 3),
+        }
+
+        python_version = sys.version_info[0]
+        minimum_version = version.get(python_version, default_version)
+
+        if sys.version_info[0:3] >= minimum_version:
+            # Create default context to skip SSL cert verification.
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            res = func(req, context=ctx)
+        else:
+            res = func(req)
+
+        return res
+
+    return inner
+
+
+@ssl_context_compat
+def urlopen(*args, **kwargs):
+    return urllib2.urlopen(*args, **kwargs)
+
+
+class ZabbixAPI(object):
+    """ZabbixAPI class, implement interface to zabbix api.
+
+    :type url: str
+    :param url: URL to zabbix api. Default: `ZABBIX_URL` or
+        `https://localhost/zabbix`
+
+    :type use_authenticate: bool
+    :param use_authenticate: Use `user.authenticate` method if `True` else
+        `user.login`.
+
+    :type use_basic_auth: bool
+    :param use_basic_auth: Using basic auth if `True`
+
+    :type user: str
+    :param user: Zabbix user name. Default: `ZABBIX_USER` or `'Admin'`.
+
+    :type password: str
+    :param password: Zabbix user password. Default `ZABBIX_PASSWORD` or
+        `zabbix`.
+
+    >>> from pyzabbix import ZabbixAPI
+    >>> z = ZabbixAPI('https://zabbix.server', user='Admin', password='zabbix')
+    >>> # Get API Version
+    >>> z.api_info.version()
+    >>> u'2.2.1'
+    >>> # or
+    >>> z.do_request('apiinfo.version')
+    >>> {u'jsonrpc': u'2.0', u'result': u'2.2.1', u'id': u'1'}
+    >>> # Get all disabled hosts
+    >>> z.host.get(status=1)
+    >>> # or
+    >>> z.do_request('host.getobjects', {'status': 1})
+    """
+
+    def __init__(self, url=None, use_authenticate=False, use_basic_auth=False, user=None,
+                 password=None):
+
+        url = url or os.environ.get('ZABBIX_URL') or 'https://localhost/zabbix'
+        user = user or os.environ.get('ZABBIX_USER') or 'Admin'
+        password = password or os.environ.get('ZABBIX_PASSWORD') or 'zabbix'
 
         self.use_authenticate = use_authenticate
-        self.use_api_token = False
-        self.auth = ""
-        self.id = 0  # pylint: disable=invalid-name
+        self.use_basic_auth = use_basic_auth
+        self.auth = None
+        self.url = url + '/api_jsonrpc.php'
+        self.base64_cred = self.cred_to_base64(user, password) if self.use_basic_auth else None
+        self._login(user, password)
+        logger.debug("JSON-PRC Server: %s", self.url)
 
-        self.timeout = timeout
+    def __getattr__(self, name):
+        """Dynamically create an object class (ie: host).
 
-        if not server.endswith("/api_jsonrpc.php"):
-            server = server.rstrip("/") + "/api_jsonrpc.php"
-        self.url = server
-        logger.info(f"JSON-RPC Server Endpoint: {self.url}")
-
-        self.version: Optional[Version] = None
-        self._detect_version = detect_version
-
-    def __enter__(self) -> "ZabbixAPI":
-        return self
-
-    # pylint: disable=inconsistent-return-statements
-    def __exit__(self, exception_type, exception_value, traceback):
-        if isinstance(exception_value, (ZabbixAPIException, type(None))):
-            if self.is_authenticated and not self.use_api_token:
-                # Logout the user if they are authenticated using username + password.
-                self.user.logout()
-            return True
-        return None
-
-    def login(
-        self,
-        user: str = "",
-        password: str = "",
-        api_token: Optional[str] = None,
-    ) -> None:
-        """Convenience method for calling user.authenticate
-        and storing the resulting auth token for further commands.
-
-        If use_authenticate is set, it uses the older (Zabbix 1.8)
-        authentication command
-
-        :param password: Password used to login into Zabbix
-        :param user: Username used to login into Zabbix
-        :param api_token: API Token to authenticate with
+        :type name: str
+        :param name: Zabbix API method group name.
+            Example: `apiinfo.version` method it will be `apiinfo`.
         """
 
-        if self._detect_version:
-            self.version = Version(self.api_version())
-            logger.info(f"Zabbix API version is: {self.version}")
+        return ZabbixAPIObjectClass(name, self)
 
-        # If the API token is explicitly provided, use this instead.
-        if api_token is not None:
-            self.use_api_token = True
-            self.auth = api_token
-            return
+    def _login(self, user='', password=''):
+        """Do login to zabbix server.
 
-        # If we have an invalid auth token, we are not allowed to send a login
-        # request. Clear it before trying.
-        self.auth = ""
+        :type user: str
+        :param user: Zabbix user
+
+        :type password: str
+        :param password: Zabbix user password
+        """
+
+        logger.debug("ZabbixAPI.login({0},{1})".format(user, HideSensitiveService.HIDEMASK))
+
+        self.auth = None
+
         if self.use_authenticate:
             self.auth = self.user.authenticate(user=user, password=password)
-        elif self.version and self.version >= ZABBIX_5_4_0:
-            self.auth = self.user.login(username=user, password=password)
         else:
             self.auth = self.user.login(user=user, password=password)
 
-    def check_authentication(self):
-        if self.use_api_token:
-            # We cannot use this call using an API Token
-            return True
-        # Convenience method for calling user.checkAuthentication of the current session
-        return self.user.checkAuthentication(sessionid=self.auth)
+    def _logout(self):
+        """Do logout from zabbix server."""
 
-    @property
-    def is_authenticated(self) -> bool:
-        if self.use_api_token:
-            # We cannot use this call using an API Token
-            return True
+        if self.auth:
+            logger.debug("ZabbixAPI.logout()")
 
-        try:
-            self.user.checkAuthentication(sessionid=self.auth)
-        except ZabbixAPIException:
-            return False
-        return True
+            if self.user.logout():
+                self.auth = None
 
-    def confimport(
-        self,
-        confformat: str = "",
-        source: str = "",
-        rules: str = "",
-    ) -> dict:
-        """Alias for configuration.import because it clashes with
-        Python's import reserved keyword
-        :param rules:
-        :param source:
-        :param confformat:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self._logout()
+
+    @staticmethod
+    def cred_to_base64(user, password):
+        """Create header for basic authorization
+        :type user: str
+        :param user: Zabbix user
+
+        :type password: str
+        :param password: Zabbix user password
+        :return: str
         """
-        warn(
-            "ZabbixAPI.confimport(format, source, rules) has been deprecated, please use "
-            "ZabbixAPI.configuration['import'](format=format, source=source, rules=rules) instead",
-            DeprecationWarning,
-            2,
-        )
+        base64string = base64.b64encode('{}:{}'.format(user, password).encode())
+        return base64string.decode()
 
-        return self.configuration["import"](
-            format=confformat,
-            source=source,
-            rules=rules,
-        )
+    def api_version(self):
+        """Return version of server Zabbix API.
 
-    def api_version(self) -> str:
+        :rtype: str
+        :return: Version of server Zabbix API.
+        """
+
         return self.apiinfo.version()
 
-    def do_request(
-        self,
-        method: str,
-        params: Optional[Union[Mapping, Sequence]] = None,
-    ) -> dict:
-        payload = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params or {},
-            "id": self.id,
+    def do_request(self, method, params=None):
+        """Make request to Zabbix API.
+
+        :type method: str
+        :param method: ZabbixAPI method, like: `apiinfo.version`.
+
+        :type params: str
+        :param params: ZabbixAPI method arguments.
+
+        >>> from pyzabbix import ZabbixAPI
+        >>> z = ZabbixAPI()
+        >>> apiinfo = z.do_request('apiinfo.version')
+        """
+
+        request_json = {
+            'jsonrpc': '2.0',
+            'method': method,
+            'params': params or {},
+            'id': '1',
         }
-        headers = {}
 
-        # We don't have to pass the auth token if asking for
-        # the apiinfo.version or user.checkAuthentication
-        anonymous_methods = {
-            "apiinfo.version",
-            "user.checkAuthentication",
-            "user.login",
-        }
-        if self.auth and method not in anonymous_methods:
-            if self.version and self.version >= ZABBIX_6_4_0:
-                headers["Authorization"] = f"Bearer {self.auth}"
-            else:
-                payload["auth"] = self.auth
+        # apiinfo.version and user.login doesn't require auth token
+        if self.auth and (method not in ('apiinfo.version', 'user.login')):
+            request_json['auth'] = self.auth
 
-        logger.debug(f"Sending: {payload}")
-        resp = self.session.post(
-            self.url,
-            json=payload,
-            headers=headers,
-            timeout=self.timeout,
-        )
-        logger.debug(f"Response Code: {resp.status_code}")
+        logger.debug(
+            'urllib2.Request({0}, {1})'.format(
+                self.url,
+                json.dumps(request_json)))
 
-        # NOTE: Getting a 412 response code means the headers are not in the
-        # list of allowed headers.
-        resp.raise_for_status()
+        data = json.dumps(request_json)
+        if not isinstance(data, bytes):
+            data = data.encode("utf-8")
 
-        if not resp.text:
-            raise ZabbixAPIException("Received empty response")
+        req = urllib2.Request(self.url, data)
+        req.get_method = lambda: 'POST'
+        req.add_header('Content-Type', 'application/json-rpc')
+        req.add_header('User-Agent', 'py-zabbix/{}'.format(__version__))
+
+        if self.use_basic_auth:
+            req.add_header("Authorization", "Basic {}".format(self.base64_cred))
 
         try:
-            response = resp.json()
-        except ValueError as exception:
-            raise ZabbixAPIException(
-                f"Unable to parse json: {resp.text}"
-            ) from exception
+            res = urlopen(req)
+            res_str = res.read().decode('utf-8')
+            res_json = json.loads(res_str)
+        except ValueError as e:
+            raise ZabbixAPIException("Unable to parse json: %s" % e.message)
 
-        logger.debug(f"Response Body: {response}")
+        res_str = json.dumps(res_json, indent=4, separators=(',', ': '))
+        logger.debug("Response Body: %s", res_str)
 
-        self.id += 1
+        if 'error' in res_json:
+            err = res_json['error'].copy()
+            err.update({'json': str(request_json)})
+            raise ZabbixAPIException(err)
 
-        if "error" in response:  # some exception
-            error = response["error"]
+        return res_json
 
-            # some errors don't contain 'data': workaround for ZBX-9340
-            if "data" not in error:
-                error["data"] = "No data"
+    def get_id(self, item_type, item=None, with_id=False, hostid=None, **args):
+        """Return id or ids of zabbix objects.
 
-            raise ZabbixAPIException(
-                f"Error {error['code']}: {error['message']}, {error['data']}",
-                error["code"],
-                error=error,
-            )
+        :type item_type: str
+        :param item_type: Type of zabbix object. (eg host, item etc.)
 
-        return response
+        :type item: str
+        :param item: Name of zabbix object. If it is `None`, return list of
+            all objects in the scope.
 
-    def _object(self, attr: str) -> "ZabbixAPIObject":
-        """Dynamically create an object class (ie: host)"""
-        return ZabbixAPIObject(attr, self)
+        :type with_id: bool
+        :param with_id: Returned values will be in zabbix json `id` format.
+            Examlpe: `{'itemid: 128}`
 
-    def __getattr__(self, attr: str) -> "ZabbixAPIObject":
-        return self._object(attr)
+        :type name: bool
+        :param name: Return name instead of id.
 
-    def __getitem__(self, attr: str) -> "ZabbixAPIObject":
-        return self._object(attr)
+        :type hostid: int
+        :param hostid: Filter objects by specific hostid.
 
+        :type templateids: int
+        :param tempateids: Filter objects which only belong to specific
+            templates by template id.
 
-# pylint: disable=too-few-public-methods
-class ZabbixAPIMethod:
-    def __init__(self, method: str, parent: ZabbixAPI):
-        self._method = method
-        self._parent = parent
+        :type app_name: str
+        :param app_name: Filter object which only belong to specific
+            application.
 
-    def __call__(self, *args, **kwargs):
-        if args and kwargs:
-            raise TypeError("Found both args and kwargs")
+        :rtype: int or list
+        :return: Return single `id`, `name` or list of values.
+        """
 
-        return self._parent.do_request(self._method, args or kwargs)["result"]
+        result = None
+        name = args.get('name', False)
 
+        type_ = '{item_type}.get'.format(item_type=item_type)
 
-# pylint: disable=too-few-public-methods
-class ZabbixAPIObject:
-    def __init__(self, name: str, parent: ZabbixAPI):
-        self._name = name
-        self._parent = parent
+        item_filter_name = {
+            'mediatype': 'description',
+            'trigger': 'description',
+            'triggerprototype': 'description',
+            'user': 'alias',
+            'usermacro': 'macro',
+        }
 
-    def _method(self, attr: str) -> ZabbixAPIMethod:
-        """Dynamically create a method (ie: get)"""
-        return ZabbixAPIMethod(f"{self._name}.{attr}", self._parent)
+        item_id_name = {
+            'discoveryrule': 'item',
+            'graphprototype': 'graph',
+            'hostgroup': 'group',
+            'itemprototype': 'item',
+            'map': 'selement',
+            'triggerprototype': 'trigger',
+            'usergroup': 'usrgrp',
+            'usermacro': 'hostmacro',
+        }
 
-    def __getattr__(self, attr: str) -> ZabbixAPIMethod:
-        return self._method(attr)
+        filter_ = {
+            'filter': {
+                item_filter_name.get(item_type, 'name'): item,
+            },
+            'output': 'extend'}
 
-    def __getitem__(self, attr: str) -> ZabbixAPIMethod:
-        return self._method(attr)
+        if hostid:
+            filter_['filter'].update({'hostid': hostid})
 
+        if args.get('templateids'):
+            if item_type == 'usermacro':
+                filter_['hostids'] = args['templateids']
+            else:
+                filter_['templateids'] = args['templateids']
 
-class ZabbixAPIObjectClass(ZabbixAPIObject):
-    def __init__(self, *args, **kwargs):
-        warn(
-            "ZabbixAPIObjectClass has been renamed to ZabbixAPIObject",
-            DeprecationWarning,
-            2,
-        )
-        super().__init__(*args, **kwargs)
+        if args.get('app_name'):
+            filter_['application'] = args['app_name']
+
+        logger.debug(
+            'do_request( "{type}", {filter} )'.format(
+                type=type_,
+                filter=filter_))
+        response = self.do_request(type_, filter_)['result']
+
+        if response:
+            item_id_str = item_id_name.get(item_type, item_type)
+            item_id = '{item}id'.format(item=item_id_str)
+            result = []
+            for obj in response:
+                # Check if object not belong current template
+                if args.get('templateids'):
+                    if (not obj.get('templateid') in ("0", None) or
+                            not len(obj.get('templateids', [])) == 0):
+                        continue
+
+                if name:
+                    o = obj.get(item_filter_name.get(item_type, 'name'))
+                    result.append(o)
+                elif with_id:
+                    result.append({item_id: int(obj.get(item_id))})
+                else:
+                    result.append(int(obj.get(item_id)))
+
+            list_types = (list, type(None))
+            if not isinstance(item, list_types):
+                result = result[0]
+
+        return result

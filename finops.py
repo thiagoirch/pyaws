@@ -2,7 +2,7 @@ import boto3
 import sys
 import datetime
 import argparse
-#from pyzabbix import ZabbixMetric, ZabbixSender
+from pyzabbix import ZabbixMetric, ZabbixSender
 ########################
 #Variáveis
 ########################
@@ -34,7 +34,6 @@ def zabbix(accountId, feaTure, zEvent):
     zServer = ZabbixSender(zabbixServer, 10051)
     zPac = [ ZabbixMetric(accountId,str(f"{accountId}-{feaTure}"), zEvent)]
     zServer.send(zPac)
-    print(f"{daTe} - Account:{accountId} - Region: {reGion} - Feature:{feaTure} - {mesSage}")
 def log(daTe, feaTure, mesSage, reGion, zEvent):
     accountId = awsAccount()
     print(f"{zEvent} - {daTe} - Account:{accountId} - Region: {reGion} - Feature:{feaTure} - {mesSage}")
@@ -127,13 +126,16 @@ def chkTgt():
 #Argumentos
 ######################
 arguMent = argparse.ArgumentParser(description='Valores para checagem')
-arguMent.add_argument('--feature', type=str, default="all", help='Declare a feature que deseja. Default:all.')
-arguMent.add_argument('--region', type=str, default="us-east-1", help='Declare a região que deseja consultar. Default:us-east-1.')
-arguMent.add_argument('--out', type=str, default="log", help='Declare aqui o modo de saída padrão [log|zabbix]. Default:log.')
+arguMent.add_argument('--feature', type=str, default="all", help='Escolha a feature que deseja. Default:all.')
+arguMent.add_argument('--region', type=str, default="us-east-1", help='Escolha a região que deseja consultar. Default:us-east-1.')
+arguMent.add_argument('--out', type=str, default="log", help='Escolha aqui o modo de saída padrão [log|zabbix]. Default:log.')
+arguMent.add_argument('--zabbixserver', type=str, default="", help='Informe o endereço do servidor zabbix')
+
 args = arguMent.parse_args()
 feaTure = args.feature
 reGion = args.region
 ouT= args.out
+zabbixServer = args.zabbixserver
 ######################
 #Aciona as funções
 ######################
