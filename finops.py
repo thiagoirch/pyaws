@@ -6,7 +6,6 @@ from pyzabbix import ZabbixMetric, ZabbixSender
 ########################
 #Variáveis
 ########################
-zabbixServer = "zbxsrv.zbx.com.br"
 dateNow = datetime.datetime.now()
 daTe = dateNow.strftime("%Y-%m-%d:%H:%M")
 
